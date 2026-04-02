@@ -7,7 +7,7 @@ def get_weather(city: str) -> str:
 
 llm = ChatOllama(
   model="qwen3.5:9b",                  # 改成你的实际模型名
-  base_url="http://192.168.2.204:11434" # 改成局域网服务器IP
+  base_url="http://192.168.2.207:11434" # 改成局域网服务器IP
 )
 
 agent = create_agent(
