@@ -11,11 +11,11 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-# 1) 先定义状态机（图）结构
+# 1) 定义graph结构
 graph_builder = StateGraph(State)
 
 
-# 2) 初始化模型客户端（这里使用 DashScope 的 OpenAI 兼容接口）
+# 2) 初始化llm
 llm = ChatOpenAI(
     model="qwen3.6-plus",          # 按你的服务端实际模型名改             
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", # 你的千问网关（OpenAI兼容）地址，形如 https://xxx/v1
@@ -28,7 +28,6 @@ def chatbot(state: State):
 
 # 3) 注册节点，并把 START 连接到 chatbot，表示图从这里开始执行
 graph_builder.add_node("chatbot", chatbot)
-
 graph_builder.add_edge(START, "chatbot")
 
 # 4) 编译图，得到可执行对象

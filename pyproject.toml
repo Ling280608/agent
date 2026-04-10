@@ -12,7 +12,9 @@ dependencies = [
     "langchain-ollama (>=1.0.1,<2.0.0)",
     "langgraph (>=1.1.4,<2.0.0)",
     "langchain-openai (>=1.1.12,<2.0.0)",
-    "langchain-tavily (>=0.2.17,<0.3.0)"
+    "langchain-tavily (>=0.2.17,<0.3.0)",
+    "fastapi[standard] (>=0.135.3,<0.136.0)",
+    "pyyaml (>=6.0.3,<7.0.0)"
 ]
 
 

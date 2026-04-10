@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Agent Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg">
+      <div class="bg__glow bg__glow--a"></div>
+      <div class="bg__glow bg__glow--b"></div>
+      <div class="bg__grid"></div>
+      <div class="bg__noise"></div>
+    </div>
+
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand__logo">
+            <span class="brand__dot"></span>
+          </div>
+          <div class="brand__text">
+            <div class="brand__name">Agent</div>
+            <div class="brand__sub">DeepSeek-ish UI</div>
+          </div>
+        </div>
+
+        <button class="btn btn--ghost" id="newChatBtn" type="button">
+          <span class="btn__icon">＋</span>
+          新对话
+        </button>
+
+        <div class="sidebar__card">
+          <div class="sidebar__label">连接信息</div>
+          <div class="kv">
+            <div class="kv__k">Model</div>
+            <div class="kv__v" id="modelBadge">Qwen</div>
+          </div>
+          <div class="kv">
+            <div class="kv__k">Session</div>
+            <div class="kv__v kv__mono" id="sessionBadge">—</div>
+          </div>
+        </div>
+
+        <div class="sidebar__hint">
+          提示：输入时按 <span class="kbd">Enter</span> 发送，
+          <span class="kbd">Shift</span>+<span class="kbd">Enter</span> 换行。
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar__title">交互式问答</div>
+          <div class="topbar__right">
+            <div class="pill">FastAPI</div>
+            <div class="pill pill--accent">LangGraph</div>
+          </div>
+        </header>
+
+        <section class="chat" id="chat">
+          <div class="msg msg--assistant">
+            <div class="msg__avatar">A</div>
+            <div class="msg__bubble">
+              你好，我已连接到后端 Agent。你可以问我任何问题。
+            </div>
+          </div>
+        </section>
+
+        <footer class="composer">
+          <div class="composer__wrap">
+            <textarea
+              id="input"
+              class="composer__input"
+              placeholder="输入你的问题…"
+              rows="1"
+            ></textarea>
+            <button id="sendBtn" class="btn btn--primary" type="button">
+              发送
+              <span class="btn__spark"></span>
+            </button>
+          </div>
+          <div class="composer__meta" id="meta">
+            <span class="dot dot--ok"></span> Ready
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
