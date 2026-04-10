@@ -38,8 +38,11 @@ tools = [weather_tool]
 llm = llm.bind_tools(tools)
 
 def chatbot(state: State):
+    print("state:", state["messages"])
     # 节点函数：读取当前 messages，调用 LLM，返回新增的一条 AI 消息。
-    return {"messages": [llm.invoke(state["messages"])]}
+    response = llm.invoke(state["messages"])
+    print("response:", response)
+    return {"messages": [response]}
 
 
 def route_tools(state: State):
@@ -67,10 +70,12 @@ graph = graph_builder.compile()
 
 
 def stream_graph_updates(user_input: str):
-    # 每次用户输入都作为新的 user message 注入图中执行
+    # graph.stream开始图的执行，并传入用户输入数据，数据开始流转
     for event in graph.stream({"messages": [{"role": "user", "content": user_input}]}):
+        #  event为一个流程下来每个节点node返回的数据字典
+        print("event:", event)
         for value in event.values():
-            # 取最新一条消息并输出
+            # 取出这个节点返回数据所有值中包含messages属性的数据，取出messages属性中最后一个消息的content并输出
             print("Assistant:", value["messages"][-1].content)
 
 # 5) 一个简单 CLI 循环：读取输入 -> 调图 -> 输出
