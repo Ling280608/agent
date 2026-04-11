@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>Agent Chat</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -45,7 +46,8 @@
         </div>
 
         <div class="sidebar__hint">
-          提示：输入时按 <span class="kbd">Enter</span> 发送，
+          支持<strong>附图 / 输入框粘贴图片</strong>（最多 4 张）、思考与流式正文。按
+          <span class="kbd">Enter</span> 发送，
           <span class="kbd">Shift</span>+<span class="kbd">Enter</span> 换行。
         </div>
       </aside>
@@ -55,7 +57,7 @@
           <div class="topbar__title">交互式问答</div>
           <div class="topbar__right">
             <div class="pill">FastAPI</div>
-            <div class="pill pill--accent">LangGraph</div>
+            <div class="pill pill--accent">SSE 流式</div>
           </div>
         </header>
 
@@ -63,17 +65,33 @@
           <div class="msg msg--assistant">
             <div class="msg__avatar">A</div>
             <div class="msg__bubble">
-              你好，我已连接到后端 Agent。你可以问我任何问题。
+              你好，我已连接到后端 Agent。支持**文字**与**附图**（点击输入框上方「附图」）多轮对话。
             </div>
           </div>
         </section>
 
         <footer class="composer">
+          <input
+            type="file"
+            id="imageInput"
+            accept="image/*"
+            multiple
+            hidden
+            aria-hidden="true"
+          />
+          <div class="composer__toolbar">
+            <button type="button" class="btn btn--ghost btn--sm" id="imageBtn" title="添加图片">
+              <span class="btn__icon">🖼</span>
+              附图
+            </button>
+            <span class="composer__toolbar-hint">可与文字一起发，也可只发图</span>
+          </div>
+          <div class="composer__previews" id="imagePreview" aria-live="polite"></div>
           <div class="composer__wrap">
             <textarea
               id="input"
               class="composer__input"
-              placeholder="输入你的问题…"
+              placeholder="输入问题… 可点「附图」或在此粘贴截图"
               rows="1"
             ></textarea>
             <button id="sendBtn" class="btn btn--primary" type="button">
@@ -88,6 +106,8 @@
       </main>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" crossorigin="anonymous"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
