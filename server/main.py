@@ -1,19 +1,24 @@
 import json
 import os
-import sys
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
 from dashscope import MultiModalConversation
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import OpenAI
-from pydantic import BaseModel, Field, model_validator
+from langchain_core.messages import AIMessage, ToolMessage, convert_to_messages, convert_to_openai_messages
 from langchain_core.tools import tool
-from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
+from langgraph._internal._config import ensure_config, patch_configurable
+from langgraph._internal._constants import CONFIG_KEY_RUNTIME
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import DEFAULT_RUNTIME
+from pydantic import BaseModel, Field, model_validator
 
 from scripts.langchain_openai_reasoning_patch import apply_langchain_openai_reasoning_content_patch
 
@@ -22,23 +27,23 @@ apply_langchain_openai_reasoning_content_patch()
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
+# LangGraph 单轮内 agent↔tools 最大往返次数（每次 tools 后再 agent 记 1）
+_CHAT_RECURSION_LIMIT = 30
+
 
 def _api_key() -> str | None:
-    # 兼容两种常见命名：OpenAI 系与阿里云 DashScope
     return os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
 
 
-def create_llm() -> ChatOpenAI:
-    """与流式 OpenAI 客户端共用同一套 endpoint/model，便于在非流式场景用 LangChain API。"""
-    kwargs: dict[str, Any] = {
-        "model": "qwen3.6-plus",
-        "base_url": DASHSCOPE_BASE_URL,
-        "api_key": _api_key(),
-        "temperature": 0,
-        "streaming": True,
-    }
-    
-    return ChatOpenAI(**kwargs)
+def _create_agent_llm() -> ChatOpenAI:
+    """图中节点用 invoke，streaming=False 即可。"""
+    return ChatOpenAI(
+        model="qwen3.6-plus",
+        base_url=DASHSCOPE_BASE_URL,
+        api_key=_api_key(),
+        temperature=0,
+        streaming=True,
+    )
 
 
 def _call_qwen_image_api(prompt: str, size: str = "1024*1024", n: int = 1) -> list[str]:
@@ -52,7 +57,6 @@ def _call_qwen_image_api(prompt: str, size: str = "1024*1024", n: int = 1) -> li
     if len(text) > 800:
         text = text[:800]
     n = max(1, min(6, int(n)))
-    # 与控制台示例一致：单轮 messages + parameters（SDK 将额外关键字写入请求体 parameters）
     rsp = MultiModalConversation.call(
         model="qwen-image-2.0",
         api_key=key,
@@ -104,56 +108,50 @@ def qwen_image_generate(prompt: str, size: str = "1024*1024", n: int = 1) -> str
     n: 生成张数 1～6。
     """
     urls = _call_qwen_image_api(prompt, size=size, n=n)
-    print(f"图片URL: {urls}")
     return "\n".join(urls)
 
 
-# 供 LangGraph ToolNode 等与 bind_tools 使用同一份工具定义
 QWEN_IMAGE_TOOLS = [qwen_image_generate]
 
-
-# 在 ChatOpenAI 上绑定 Qwen-Image-2.0 文生图工具
-LLM = create_llm().bind_tools(QWEN_IMAGE_TOOLS)
-
-# SSE 用「原始」OpenAI SDK 读 delta.reasoning_content；若用 LLM.stream()，需依赖上方 reasoning 补丁
-_STREAM_CLIENT: OpenAI | None = None
-
-# 从流式 delta 取思考片段（厂商字段名可能为 reasoning_content 或 thinking）
-def _delta_reasoning(delta: Any) -> str:
-    """从流式 delta 取思考片段（厂商字段名可能为 reasoning_content 或 thinking）。"""
-    if delta is None:
-        return ""
-    ak = getattr(delta, "additional_kwargs", None) or {}
-    rc = ak.get("reasoning_content")
-    if rc:
-        return rc if isinstance(rc, str) else str(rc)
-    return ""
-
-# 从流式 delta 取对用户可见的正文增量（标准 content 字段）
-def _delta_answer(delta: Any) -> str:
-    """从流式 delta 取对用户可见的正文增量（标准 content 字段）。"""
-    if delta is None:
-        return ""
-    if isinstance(delta, dict):
-        c = delta.get("content")
-    else:
-        c = getattr(delta, "content", None)
-    if not c:
-        return ""
-    return c if isinstance(c, str) else str(c)
+_AGENT_LLM = _create_agent_llm().bind_tools(QWEN_IMAGE_TOOLS)
 
 
-# 多模态：单图 base64 体积上限（字符数，约对应数 MB 原图）
+CHAT_TOOL_NODE = ToolNode(QWEN_IMAGE_TOOLS)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+def _agent_node(state: AgentState) -> dict[str, list]:
+    response = _AGENT_LLM.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+def _route_tools(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
+        return "tools"
+    return END
+
+
+def _build_chat_graph():
+    b = StateGraph(AgentState)
+    b.add_node("agent", _agent_node)
+    b.add_node("tools", CHAT_TOOL_NODE)
+    b.add_edge(START, "agent")
+    b.add_conditional_edges("agent", _route_tools, {"tools": "tools", END: END})
+    b.add_edge("tools", "agent")
+    return b.compile()
+
+
+CHAT_GRAPH = _build_chat_graph()
+
 _MAX_IMAGES_PER_REQUEST = 4
 _MAX_DATA_URL_LEN = 6_500_000
 
-# 验证传来的图片 URL 是否合法
 def _validate_image_url(url: str) -> str:
-    """
-    接受：
-    - data:image/<subtype>;base64,<data>（浏览器 FileReader 典型产物）
-    - http(s) 公网图链（若网关支持）
-    """
+    """验证传来的图片 URL 是否合法"""
     u = (url or "").strip()
     if not u:
         raise ValueError("图片地址为空")
@@ -186,7 +184,6 @@ def _build_user_message(message: str, images: Optional[List[str]]) -> dict[str, 
     return {"role": "user", "content": parts}
 
 
-# key：前端回传的 session_id；value：OpenAI 风格 messages（content 可为 str 或多模态 list）
 _SESSIONS: Dict[str, List[dict]] = {}
 
 # 消息结构体
@@ -215,8 +212,8 @@ app = FastAPI(title="Agent Web")
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     """
-    SSE：session →（可选）thinking → token（正文）→ done。
-    思考链走原生流式 delta；会话仍为 OpenAI 风格 messages 列表。
+    SSE：LangGraph（agent ↔ tools）驱动；事件含 session、thinking、token、tool_result、done。
+    会话存 OpenAI 风格消息列表，与 convert_to_messages / convert_to_openai_messages 对齐。
     """
 
     def event_stream():
@@ -226,10 +223,10 @@ def chat(req: ChatRequest):
 
         # 1) 确定会话：无 session_id 则新建 UUID，后续请求带同一 id 即续聊
         session_id = req.session_id or str(uuid.uuid4())
-        messages = _SESSIONS.get(session_id)
-        if messages is None:
-            messages = []
-            _SESSIONS[session_id] = messages
+        history = _SESSIONS.get(session_id)
+        if history is None:
+            history = []
+            _SESSIONS[session_id] = history
 
         # 2) 本轮用户消息：纯文本或多模态（与通义 OpenAI 兼容格式一致），写入会话供后续轮次使用
         try:
@@ -237,28 +234,87 @@ def chat(req: ChatRequest):
         except ValueError as ve:
             yield sse({"event": "error", "detail": str(ve)})
             return
-        messages.append(user_msg)
 
-        full_message = None
+        messages_dicts = [*history, user_msg]
+
         try:
-            # 3) 首包带上 session_id，前端可立即保存，不必等流结束
-            yield sse({"event": "session", "session_id": session_id})
-            client = LLM
-            for chunk in client.stream(messages):
-                if full_message is None:
-                    full_message = chunk
-                else:
-                    full_message += chunk
-                think = _delta_reasoning(chunk)
-                print(f"思考片段: {think}")
-                if think:
-                    yield sse({"event": "thinking", "text": think})
-                ans = _delta_answer(chunk)
-                if ans:
-                    print(f"正文: {ans}")
-                    yield sse({"event": "token", "text": ans})
+            lc_messages = convert_to_messages(messages_dicts)
+        except Exception as e:
+            yield sse({"event": "error", "detail": f"消息解析失败: {e}"})
+            return
+
+        yield sse({"event": "session", "session_id": session_id})
+
+        # 本轮可变的 LangChain 消息列表（含历史 + 本回合用户消息）；流式循环内就地追加 AI / ToolMessage
+        working_msgs = list(lc_messages)
+
+        try:
+            # 与 CHAT_GRAPH 相同的 agent ↔ tools 上限；每轮先 stream 再决定是否进 ToolNode
+            for _ in range(_CHAT_RECURSION_LIMIT):
+                # 通义 reasoning_content 在流式里可能为「累计字符串」，用前缀差分避免重复推送
+                last_rc = ""
+                acc = None
+                
+                # 流式输出内容
+                for chunk in _AGENT_LLM.stream(working_msgs):
+                    acc = chunk if acc is None else acc + chunk
+                    ak = chunk.additional_kwargs or {}
+                    rc = ak.get("reasoning_content")
+                    if rc and isinstance(rc, str):
+                        if rc.startswith(last_rc):
+                            delta = rc[len(last_rc) :]
+                            last_rc = rc
+                            if delta:
+                                yield sse({"event": "thinking", "text": delta})
+                        else:
+                            last_rc = rc
+                            yield sse({"event": "thinking", "text": rc})
+                    c = chunk.content
+                    if c:
+                        text = c if isinstance(c, str) else str(c)
+                        if text:
+                            yield sse({"event": "token", "text": text})
+
+                if acc is None:
+                    break
+
+                # 将流式块上的 tool_call_chunks 规整为 tool_calls，便于 ToolNode 与 OpenAI 互转
+                acc.init_tool_calls()
+                ai_msg = AIMessage(
+                    content=acc.content,
+                    tool_calls=list(acc.tool_calls or []),
+                    additional_kwargs=dict(acc.additional_kwargs or {}),
+                    response_metadata=dict(acc.response_metadata or {}),
+                )
+                working_msgs.append(ai_msg)
+
+                if not ai_msg.tool_calls:
+                    break
+
+                # LangGraph 1.1+ 的 ToolNode 需要注入 runtime；仅在编译图内跑节点时 Pregel 会写入 __pregel_runtime。
+                # SSE 手写循环在图外 invoke，若不补 DEFAULT_RUNTIME，会报 Missing required config key 'N/A' for 'tools'。
+                _tn_cfg = patch_configurable(
+                    ensure_config(),
+                    {CONFIG_KEY_RUNTIME: DEFAULT_RUNTIME},
+                )
+                tool_out = CHAT_TOOL_NODE.invoke(
+                    {"messages": working_msgs},
+                    config=_tn_cfg,
+                )
+                for tm in tool_out["messages"]:
+                    working_msgs.append(tm)
+                    if isinstance(tm, ToolMessage):
+                        yield sse(
+                            {
+                                "event": "tool_result",
+                                "tool_call_id": tm.tool_call_id,
+                                "name": tm.name or "",
+                                "content": tm.content if isinstance(tm.content, str) else str(tm.content)
+                            }
+                        )
+
+            _SESSIONS[session_id] = convert_to_openai_messages(working_msgs)
             yield sse({"event": "done"})
-            print(f"full_message: {full_message}")
         except Exception as e:
             yield sse({"event": "error", "detail": str(e)})
 
@@ -268,7 +324,6 @@ def chat(req: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            # 关闭反向代理对响应体的缓冲，否则 SSE 会整块延迟到达浏览器
             "X-Accel-Buffering": "no",
         },
     )
