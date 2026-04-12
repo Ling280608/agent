@@ -1,32 +1,25 @@
-"""
-聊天 API：FastAPI + LangChain（ChatOpenAI 配置）+ 通义兼容流式。
-
-为何「思考」不能只用 LLM.stream()：
-  LangChain 的 ChatOpenAI 在把 OpenAI 兼容接口的流式 chunk 转成 AIMessageChunk 时，
-  只解析标准字段 content，不会把第三方扩展字段（如通义/DashScope 的 reasoning_content）
-  写进 chunk，因此 enable_thinking=true 时思考文本在 LangChain 流式路径里拿不到。
-
-做法：
-  SSE 仍用官方 openai 库的 chat.completions.create(stream=True)，直接读 delta 上的
-  reasoning_content 与 content，分别推 thinking / token 事件；模型参数与 ChatOpenAI 对齐。
-"""
-
 import json
 import os
+import sys
 import uuid
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+from dashscope import MultiModalConversation
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
-
+from langchain_core.tools import tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
 
-# --- 与网关、模型相关的环境变量（流式客户端与 ChatOpenAI 共用） ---
-CHAT_MODEL = "qwen3.6-plus"
+from scripts.langchain_openai_reasoning_patch import apply_langchain_openai_reasoning_content_patch
+
+# 须在实例化 ChatOpenAI 之前执行（实现langchain PR #35065 一致：保留 reasoning_content）
+apply_langchain_openai_reasoning_content_patch()
+
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
@@ -35,56 +28,108 @@ def _api_key() -> str | None:
     return os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
 
 
-def _enable_thinking() -> bool:
-    # 为 True 时请求体会带 enable_thinking，模型才可能返回 reasoning_content
-    return True
-
-
 def create_llm() -> ChatOpenAI:
     """与流式 OpenAI 客户端共用同一套 endpoint/model，便于在非流式场景用 LangChain API。"""
     kwargs: dict[str, Any] = {
-        "model": CHAT_MODEL,
+        "model": "qwen3.6-plus",
         "base_url": DASHSCOPE_BASE_URL,
         "api_key": _api_key(),
         "temperature": 0,
+        "streaming": True,
     }
-    # 通义兼容接口的扩展参数需放在 extra_body，不能混进标准 OpenAI 顶层字段
-    if _enable_thinking():
-        kwargs["extra_body"] = {"enable_thinking": True}
+    
     return ChatOpenAI(**kwargs)
 
 
-# 进程内单例：供 invoke / 链式编排等非 SSE 场景使用
-LLM = create_llm()
+def _call_qwen_image_api(prompt: str, size: str = "1024*1024", n: int = 1) -> list[str]:
+    """通过 DashScope SDK（MultiModalConversation）调用同步文生图，返回 PNG 临时 URL 列表。"""
+    key = _api_key()
+    if not key:
+        raise ValueError("未配置 OPENAI_API_KEY 或 DASHSCOPE_API_KEY")
+    text = (prompt or "").strip()
+    if not text:
+        raise ValueError("文生图提示词不能为空")
+    if len(text) > 800:
+        text = text[:800]
+    n = max(1, min(6, int(n)))
+    # 与控制台示例一致：单轮 messages + parameters（SDK 将额外关键字写入请求体 parameters）
+    rsp = MultiModalConversation.call(
+        model="qwen-image-2.0",
+        api_key=key,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"text": text}],
+            }
+        ],
+        size=size,
+        n=n,
+        watermark=False,
+        request_timeout=180,
+    )
+    if rsp.status_code != HTTPStatus.OK:
+        raise RuntimeError(getattr(rsp, "message", None) or f"HTTP {rsp.status_code}")
+    if getattr(rsp, "code", None):
+        raise RuntimeError(getattr(rsp, "message", None) or str(rsp.code))
+    output = getattr(rsp, "output", None)
+    if output is None:
+        raise RuntimeError("文生图无 output: " + str(rsp)[:800])
+    choices = output.get("choices") if isinstance(output, dict) else getattr(output, "choices", None)
+    if not choices:
+        raise RuntimeError("文生图 output 无 choices: " + str(rsp)[:800])
+    urls: list[str] = []
+    for ch in choices:
+        msg = ch.get("message") if isinstance(ch, dict) else getattr(ch, "message", None)
+        if msg is None:
+            continue
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if not content:
+            continue
+        for part in content:
+            if isinstance(part, dict):
+                u = part.get("image")
+                if u:
+                    urls.append(u if isinstance(u, str) else str(u))
+    if not urls:
+        raise RuntimeError("文生图未返回图片地址: " + str(rsp)[:800])
+    return urls
 
-# SSE 必须用「原始」OpenAI SDK：LangChain 流式不会透出 reasoning_content
+
+@tool
+def qwen_image_generate(prompt: str, size: str = "1024*1024", n: int = 1) -> str:
+    """使用 Qwen-Image-2.0 根据文字描述生成 PNG 图片（返回临时 URL，请在有效期内下载）。
+    当用户需要插画、海报、概念图、配图、文生图、画一张图、生成示意图时调用。
+    prompt: 画面内容、风格、构图的中英文描述（约 800 字内）。
+    size: 分辨率 宽*高，如 1024*1024、2048*2048、2688*1536（16:9）、1536*2688（9:16）。
+    n: 生成张数 1～6。
+    """
+    urls = _call_qwen_image_api(prompt, size=size, n=n)
+    print(f"图片URL: {urls}")
+    return "\n".join(urls)
+
+
+# 供 LangGraph ToolNode 等与 bind_tools 使用同一份工具定义
+QWEN_IMAGE_TOOLS = [qwen_image_generate]
+
+
+# 在 ChatOpenAI 上绑定 Qwen-Image-2.0 文生图工具
+LLM = create_llm().bind_tools(QWEN_IMAGE_TOOLS)
+
+# SSE 用「原始」OpenAI SDK 读 delta.reasoning_content；若用 LLM.stream()，需依赖上方 reasoning 补丁
 _STREAM_CLIENT: OpenAI | None = None
 
-def _stream_openai_client() -> OpenAI:
-    """流式 OpenAI 客户端：单例，供 SSE 流式使用"""
-    global _STREAM_CLIENT
-    if _STREAM_CLIENT is None:
-        _STREAM_CLIENT = OpenAI(base_url=DASHSCOPE_BASE_URL, api_key=_api_key())
-    return _STREAM_CLIENT
-
-
+# 从流式 delta 取思考片段（厂商字段名可能为 reasoning_content 或 thinking）
 def _delta_reasoning(delta: Any) -> str:
     """从流式 delta 取思考片段（厂商字段名可能为 reasoning_content 或 thinking）。"""
     if delta is None:
         return ""
-    if isinstance(delta, dict):
-        for name in ("reasoning_content", "thinking"):
-            v = delta.get(name)
-            if v:
-                return v if isinstance(v, str) else str(v)
-        return ""
-    for name in ("reasoning_content", "thinking"):
-        v = getattr(delta, name, None)
-        if v:
-            return v if isinstance(v, str) else str(v)
+    ak = getattr(delta, "additional_kwargs", None) or {}
+    rc = ak.get("reasoning_content")
+    if rc:
+        return rc if isinstance(rc, str) else str(rc)
     return ""
 
-
+# 从流式 delta 取对用户可见的正文增量（标准 content 字段）
 def _delta_answer(delta: Any) -> str:
     """从流式 delta 取对用户可见的正文增量（标准 content 字段）。"""
     if delta is None:
@@ -102,7 +147,7 @@ def _delta_answer(delta: Any) -> str:
 _MAX_IMAGES_PER_REQUEST = 4
 _MAX_DATA_URL_LEN = 6_500_000
 
-
+# 验证传来的图片 URL 是否合法
 def _validate_image_url(url: str) -> str:
     """
     接受：
@@ -122,7 +167,7 @@ def _validate_image_url(url: str) -> str:
         raise ValueError("单张图片过大，请压缩或缩小尺寸后重试")
     return u
 
-
+# 创建用户消息
 def _build_user_message(message: str, images: Optional[List[str]]) -> dict[str, Any]:
     """
     纯文本：OpenAI 风格 {"role":"user","content":"..."}。
@@ -144,7 +189,7 @@ def _build_user_message(message: str, images: Optional[List[str]]) -> dict[str, 
 # key：前端回传的 session_id；value：OpenAI 风格 messages（content 可为 str 或多模态 list）
 _SESSIONS: Dict[str, List[dict]] = {}
 
-
+# 消息结构体
 class ChatRequest(BaseModel):
     """message 与 images 至少其一；images 为 data URL 或 http(s) 链接列表。"""
 
@@ -163,6 +208,7 @@ class ChatRequest(BaseModel):
         return self
 
 
+# FastAPI 应用
 app = FastAPI(title="Agent Web")
 
 
@@ -193,43 +239,29 @@ def chat(req: ChatRequest):
             return
         messages.append(user_msg)
 
+        full_message = None
         try:
             # 3) 首包带上 session_id，前端可立即保存，不必等流结束
             yield sse({"event": "session", "session_id": session_id})
-            answer_pieces: List[str] = []
-            create_kw: dict[str, Any] = {
-                "model": CHAT_MODEL,
-                "messages": messages,
-                "stream": True,
-            }
-            if _enable_thinking():
-                create_kw["extra_body"] = {"enable_thinking": True}
-            # 4) 建立流式连接；messages 中最后一条已是当前 user，模型在此基础上续写 assistant
-            stream = _stream_openai_client().chat.completions.create(**create_kw)
-            for chunk in stream:
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                if delta is None:
-                    continue
-                # 5) 同一 chunk 可能只有思考、只有正文、或两者都有，分支独立 yield
-                think = _delta_reasoning(delta)
+            client = LLM
+            for chunk in client.stream(messages):
+                if full_message is None:
+                    full_message = chunk
+                else:
+                    full_message += chunk
+                think = _delta_reasoning(chunk)
+                print(f"思考片段: {think}")
                 if think:
                     yield sse({"event": "thinking", "text": think})
-                ans = _delta_answer(delta)
+                ans = _delta_answer(chunk)
                 if ans:
-                    answer_pieces.append(ans)
+                    print(f"正文: {ans}")
                     yield sse({"event": "token", "text": ans})
-            # 流结束：拼接正文写入会话，供下一轮多轮对话；思考内容不写入 messages（避免回传模型）
-            assistant_text = "".join(answer_pieces)
-            messages.append({"role": "assistant", "content": assistant_text})
             yield sse({"event": "done"})
+            print(f"full_message: {full_message}")
         except Exception as e:
-            # 响应头已是 200 且 body 为事件流，错误用 error 事件传出，前端统一展示
             yield sse({"event": "error", "detail": str(e)})
 
-    # Starlette 会迭代生成器：每次 yield 的字节块立刻发往客户端，实现打字机效果
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
