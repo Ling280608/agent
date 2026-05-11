@@ -3,13 +3,9 @@ import os
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-<<<<<<< HEAD
-from typing import Any, Dict, List, Optional
-=======
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from dashscope import MultiModalConversation
->>>>>>> 5c8c228225db2569a0475df071d5e9770bd42dca
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
